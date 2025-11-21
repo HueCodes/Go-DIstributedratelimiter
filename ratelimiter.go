@@ -10,8 +10,17 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
+// Config holds the configuration for the rate limiter.
+type Config struct {
+	RedisAddr      string
+	RedisPassword  string
+	MaxRetries     int
+	BaseRetryDelay time.Duration
+	Rate           float64 // Tokens per second (refill rate)
+	Burst          float64 // Max tokens in bucket (bucket size)
+}
+
 // RateLimiter implements a distributed token bucket rate limiter using Redis.
-// It uses a simple SETNX-based lock for distributed locking (for simplicity; consider Redlock for production).
 type RateLimiter struct {
 	client     *redis.Client
 	bucketSize float64       // Max tokens in bucket
@@ -20,22 +29,35 @@ type RateLimiter struct {
 	lockTTL    time.Duration // TTL for locks to prevent deadlocks
 }
 
-// NewRateLimiter creates a new distributed rate limiter.
-// bucketSize: maximum tokens in the bucket.
-// refillRate: tokens added per second.
-func NewRateLimiter(client *redis.Client, bucketSize, refillRate float64) *RateLimiter {
+// NewRateLimiter creates a new distributed rate limiter from a Config.
+func NewRateLimiter(ctx context.Context, cfg Config) (*RateLimiter, error) {
+	client := redis.NewClient(&redis.Options{
+		Addr:     cfg.RedisAddr,
+		Password: cfg.RedisPassword,
+		DB:       0,
+	})
+
+	// Test connection
+	if err := client.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
+	}
+
 	return &RateLimiter{
 		client:     client,
-		bucketSize: bucketSize,
-		refillRate: refillRate,
+		bucketSize: cfg.Burst,
+		refillRate: cfg.Rate,
 		keyPrefix:  "ratelimiter:",
-		lockTTL:    1 * time.Second, // Short TTL to avoid long-held locks
-	}
+		lockTTL:    1 * time.Second,
+	}, nil
+}
+
+// Close closes the Redis client connection.
+func (rl *RateLimiter) Close() error {
+	return rl.client.Close()
 }
 
 // Allow checks if a request is allowed for the given key.
-// Returns true if allowed (token consumed), false if rate limited.
-func (rl *RateLimiter) Allow(ctx context.Context, key string) (bool, error) {
+func (rl *RateLimiter) Allow(ctx context.Context, key string, tokens float64) (bool, error) {
 	dataKey := rl.keyPrefix + key
 	lockKey := dataKey + ":lock"
 
