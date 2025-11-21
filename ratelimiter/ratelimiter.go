@@ -61,15 +61,42 @@ func (rl *RateLimiter) Allow(ctx context.Context, key string, tokens float64) (b
 	dataKey := rl.keyPrefix + key
 	lockKey := dataKey + ":lock"
 
-	// Acquire lock (simple SETNX; use a Redlock library like github.com/bsm/redislock for robustness)
-	locked, err := rl.client.SetNX(ctx, lockKey, "locked", rl.lockTTL).Result()
-	if err != nil {
-		return false, fmt.Errorf("failed to acquire lock: %w", err)
+	// Generate unique lock value to prevent accidentally deleting another client's lock
+	lockValue := fmt.Sprintf("%d", time.Now().UnixNano())
+
+	// Retry lock acquisition with exponential backoff
+	maxRetries := 3
+	retryDelay := 10 * time.Millisecond
+
+	var locked bool
+	var err error
+	for i := 0; i < maxRetries; i++ {
+		locked, err = rl.client.SetNX(ctx, lockKey, lockValue, rl.lockTTL).Result()
+		if err != nil {
+			return false, fmt.Errorf("failed to acquire lock: %w", err)
+		}
+		if locked {
+			break
+		}
+		time.Sleep(retryDelay)
+		retryDelay *= 2
 	}
+
 	if !locked {
-		return false, nil // Lock not acquired, treat as busy (rate limit or retry)
+		return false, fmt.Errorf("failed to acquire lock after retries")
 	}
-	defer rl.client.Del(ctx, lockKey) // Release lock
+
+	// Release lock only if we still own it (using Lua script for atomicity)
+	defer func() {
+		script := `
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+            else
+                return 0
+            end
+        `
+		rl.client.Eval(ctx, script, []string{lockKey}, lockValue)
+	}()
 
 	// Fetch current state (tokens and last refill time as Unix nano)
 	fields, err := rl.client.HMGet(ctx, dataKey, "tokens", "last").Result()
@@ -77,18 +104,18 @@ func (rl *RateLimiter) Allow(ctx context.Context, key string, tokens float64) (b
 		return false, fmt.Errorf("failed to fetch bucket: %w", err)
 	}
 
-	var tokens float64
+	var tokensInBucket float64
 	var last int64
 	if err == redis.Nil || len(fields) < 2 || fields[0] == nil {
 		// Initialize bucket
-		tokens = rl.bucketSize
+		tokensInBucket = rl.bucketSize
 		last = time.Now().UnixNano()
 	} else {
 		tokensStr, ok := fields[0].(string)
 		if !ok {
 			return false, fmt.Errorf("invalid tokens field")
 		}
-		tokens, err = strconv.ParseFloat(tokensStr, 64)
+		tokensInBucket, err = strconv.ParseFloat(tokensStr, 64)
 		if err != nil {
 			return false, fmt.Errorf("invalid tokens value: %w", err)
 		}
