@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/<your-username>/ratelimiter"
+	"github.com/HueCodes/Go-DIstributedratelimiter/ratelimiter"
 )
 
 // Middleware wraps an HTTP handler with rate limiting.
