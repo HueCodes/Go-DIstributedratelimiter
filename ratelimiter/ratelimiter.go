@@ -106,25 +106,26 @@ func (rl *RateLimiter) Allow(ctx context.Context, key string, tokens float64) (b
 	// Refill tokens based on elapsed time
 	now := time.Now().UnixNano()
 	elapsedSeconds := float64(now-last) / 1e9
-	tokens += elapsedSeconds * rl.refillRate
-	if tokens > rl.bucketSize {
-		tokens = rl.bucketSize
+	currentTokens := tokensInBucket + (elapsedSeconds * rl.refillRate)
+	if currentTokens > rl.bucketSize {
+		currentTokens = rl.bucketSize
 	}
 
-	if tokens < 1 {
+	// Check if we have enough tokens
+	if currentTokens < tokens {
 		// Save last time even if not consuming (for accurate refill)
-		_, err = rl.client.HMSet(ctx, dataKey, "tokens", fmt.Sprintf("%.2f", tokens), "last", fmt.Sprintf("%d", now)).Result()
+		_, err = rl.client.HMSet(ctx, dataKey, "tokens", fmt.Sprintf("%.2f", currentTokens), "last", fmt.Sprintf("%d", now)).Result()
 		if err != nil {
 			return false, fmt.Errorf("failed to save bucket: %w", err)
 		}
 		return false, nil
 	}
 
-	// Consume token
-	tokens = math.Max(0, tokens-1)
+	// Consume requested tokens
+	currentTokens = math.Max(0, currentTokens-tokens)
 
 	// Save updated state
-	_, err = rl.client.HMSet(ctx, dataKey, "tokens", fmt.Sprintf("%.2f", tokens), "last", fmt.Sprintf("%d", now)).Result()
+	_, err = rl.client.HMSet(ctx, dataKey, "tokens", fmt.Sprintf("%.2f", currentTokens), "last", fmt.Sprintf("%d", now)).Result()
 	if err != nil {
 		return false, fmt.Errorf("failed to save bucket: %w", err)
 	}
