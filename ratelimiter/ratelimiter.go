@@ -3,8 +3,6 @@ package ratelimiter
 import (
 	"context"
 	"fmt"
-	"math"
-	"strconv"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -14,40 +12,104 @@ import (
 type Config struct {
 	RedisAddr      string
 	RedisPassword  string
-	MaxRetries     int
-	BaseRetryDelay time.Duration
-	Rate           float64 // Tokens per second (refill rate)
-	Burst          float64 // Max tokens in bucket (bucket size)
+	RedisDB        int
+	KeyPrefix      string
+	Rate           float64       // Tokens per second (refill rate)
+	Burst          float64       // Max tokens in bucket (bucket size)
+	KeyTTL         time.Duration // TTL for bucket keys (cleanup inactive keys)
+}
+
+// Validate checks if the config is valid.
+func (cfg Config) Validate() error {
+	if cfg.RedisAddr == "" {
+		return fmt.Errorf("RedisAddr is required")
+	}
+	if cfg.Rate <= 0 {
+		return fmt.Errorf("Rate must be > 0, got: %f", cfg.Rate)
+	}
+	if cfg.Burst <= 0 {
+		return fmt.Errorf("Burst must be > 0, got: %f", cfg.Burst)
+	}
+	return nil
 }
 
 // RateLimiter implements a distributed token bucket rate limiter using Redis.
 type RateLimiter struct {
 	client     *redis.Client
-	bucketSize float64       // Max tokens in bucket
-	refillRate float64       // Tokens added per second
-	keyPrefix  string        // Prefix for Redis keys
-	lockTTL    time.Duration // TTL for locks to prevent deadlocks
+	bucketSize float64
+	refillRate float64
+	keyPrefix  string
+	keyTTL     time.Duration
+	script     *redis.Script
 }
+
+// Lua script for atomic token bucket operations.
+// This eliminates the need for locking and reduces round trips to 1.
+const luaScript = `
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local burst = tonumber(ARGV[3])
+local tokens_requested = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[5])
+
+local bucket = redis.call('HMGET', key, 'tokens', 'last')
+local tokens = tonumber(bucket[1])
+local last = tonumber(bucket[2])
+
+if tokens == nil then
+    tokens = burst
+    last = now
+end
+
+local elapsed = math.max(0, now - last)
+local current_tokens = math.min(burst, tokens + (elapsed / 1e9) * rate)
+
+if current_tokens >= tokens_requested then
+    current_tokens = current_tokens - tokens_requested
+    redis.call('HSET', key, 'tokens', tostring(current_tokens), 'last', tostring(now))
+    redis.call('EXPIRE', key, ttl)
+    return 1
+else
+    redis.call('HSET', key, 'tokens', tostring(current_tokens), 'last', tostring(now))
+    redis.call('EXPIRE', key, ttl)
+    return 0
+end
+`
 
 // NewRateLimiter creates a new distributed rate limiter from a Config.
 func NewRateLimiter(ctx context.Context, cfg Config) (*RateLimiter, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
 	client := redis.NewClient(&redis.Options{
 		Addr:     cfg.RedisAddr,
 		Password: cfg.RedisPassword,
-		DB:       0,
+		DB:       cfg.RedisDB,
 	})
 
-	// Test connection
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
+	}
+
+	keyPrefix := cfg.KeyPrefix
+	if keyPrefix == "" {
+		keyPrefix = "ratelimiter:"
+	}
+
+	keyTTL := cfg.KeyTTL
+	if keyTTL == 0 {
+		keyTTL = 1 * time.Hour
 	}
 
 	return &RateLimiter{
 		client:     client,
 		bucketSize: cfg.Burst,
 		refillRate: cfg.Rate,
-		keyPrefix:  "ratelimiter:",
-		lockTTL:    1 * time.Second,
+		keyPrefix:  keyPrefix,
+		keyTTL:     keyTTL,
+		script:     redis.NewScript(luaScript),
 	}, nil
 }
 
@@ -57,105 +119,35 @@ func (rl *RateLimiter) Close() error {
 }
 
 // Allow checks if a request is allowed for the given key.
+// It atomically updates the token bucket and returns true if tokens are available.
 func (rl *RateLimiter) Allow(ctx context.Context, key string, tokens float64) (bool, error) {
+	if tokens <= 0 {
+		return false, fmt.Errorf("tokens must be > 0, got: %f", tokens)
+	}
+
 	dataKey := rl.keyPrefix + key
-	lockKey := dataKey + ":lock"
-
-	// Generate unique lock value to prevent accidentally deleting another client's lock
-	lockValue := fmt.Sprintf("%d", time.Now().UnixNano())
-
-	// Retry lock acquisition with exponential backoff
-	maxRetries := 3
-	retryDelay := 10 * time.Millisecond
-
-	var locked bool
-	var err error
-	for i := 0; i < maxRetries; i++ {
-		locked, err = rl.client.SetNX(ctx, lockKey, lockValue, rl.lockTTL).Result()
-		if err != nil {
-			return false, fmt.Errorf("failed to acquire lock: %w", err)
-		}
-		if locked {
-			break
-		}
-		time.Sleep(retryDelay)
-		retryDelay *= 2
-	}
-
-	if !locked {
-		return false, fmt.Errorf("failed to acquire lock after retries")
-	}
-
-	// Release lock only if we still own it (using Lua script for atomicity)
-	defer func() {
-		script := `
-            if redis.call("get", KEYS[1]) == ARGV[1] then
-                return redis.call("del", KEYS[1])
-            else
-                return 0
-            end
-        `
-		rl.client.Eval(ctx, script, []string{lockKey}, lockValue)
-	}()
-
-	// Fetch current state (tokens and last refill time as Unix nano)
-	fields, err := rl.client.HMGet(ctx, dataKey, "tokens", "last").Result()
-	if err != nil && err != redis.Nil {
-		return false, fmt.Errorf("failed to fetch bucket: %w", err)
-	}
-
-	var tokensInBucket float64
-	var last int64
-	if err == redis.Nil || len(fields) < 2 || fields[0] == nil {
-		// Initialize bucket
-		tokensInBucket = rl.bucketSize
-		last = time.Now().UnixNano()
-	} else {
-		tokensStr, ok := fields[0].(string)
-		if !ok {
-			return false, fmt.Errorf("invalid tokens field")
-		}
-		tokensInBucket, err = strconv.ParseFloat(tokensStr, 64)
-		if err != nil {
-			return false, fmt.Errorf("invalid tokens value: %w", err)
-		}
-
-		lastStr, ok := fields[1].(string)
-		if !ok {
-			return false, fmt.Errorf("invalid last field")
-		}
-		last, err = strconv.ParseInt(lastStr, 10, 64)
-		if err != nil {
-			return false, fmt.Errorf("invalid last value: %w", err)
-		}
-	}
-
-	// Refill tokens based on elapsed time
 	now := time.Now().UnixNano()
-	elapsedSeconds := float64(now-last) / 1e9
-	currentTokens := tokensInBucket + (elapsedSeconds * rl.refillRate)
-	if currentTokens > rl.bucketSize {
-		currentTokens = rl.bucketSize
-	}
+	ttlSeconds := int(rl.keyTTL.Seconds())
 
-	// Check if we have enough tokens
-	if currentTokens < tokens {
-		// Save last time even if not consuming (for accurate refill)
-		_, err = rl.client.HMSet(ctx, dataKey, "tokens", fmt.Sprintf("%.2f", currentTokens), "last", fmt.Sprintf("%d", now)).Result()
-		if err != nil {
-			return false, fmt.Errorf("failed to save bucket: %w", err)
-		}
-		return false, nil
-	}
+	result, err := rl.script.Run(
+		ctx,
+		rl.client,
+		[]string{dataKey},
+		now,
+		rl.refillRate,
+		rl.bucketSize,
+		tokens,
+		ttlSeconds,
+	).Result()
 
-	// Consume requested tokens
-	currentTokens = math.Max(0, currentTokens-tokens)
-
-	// Save updated state
-	_, err = rl.client.HMSet(ctx, dataKey, "tokens", fmt.Sprintf("%.2f", currentTokens), "last", fmt.Sprintf("%d", now)).Result()
 	if err != nil {
-		return false, fmt.Errorf("failed to save bucket: %w", err)
+		return false, fmt.Errorf("failed to execute rate limit check: %w", err)
 	}
 
-	return true, nil
+	allowed, ok := result.(int64)
+	if !ok {
+		return false, fmt.Errorf("unexpected script result type: %T", result)
+	}
+
+	return allowed == 1, nil
 }
