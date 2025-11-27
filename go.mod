@@ -1,6 +1,6 @@
 module github.com/HueCodes/Go-DIstributedratelimiter
 
-go 1.25.4
+go 1.21
 
 require github.com/go-redis/redis/v8 v8.11.5
 
