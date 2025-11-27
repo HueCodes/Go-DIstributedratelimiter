@@ -366,3 +366,316 @@ func TestAllow_Concurrency(t *testing.T) {
 		t.Errorf("Allowed %d requests, expected around 50", allowedCount)
 	}
 }
+
+func TestAllow_FractionalTokens(t *testing.T) {
+	setupTestRedis(t)
+
+	ctx := context.Background()
+	cfg := Config{
+		RedisAddr: "localhost:6379",
+		RedisDB:   15,
+		Rate:      10,
+		Burst:     10,
+	}
+
+	rl, err := NewRateLimiter(ctx, cfg)
+	if err != nil {
+		t.Fatalf("NewRateLimiter() error = %v", err)
+	}
+	defer rl.Close()
+
+	allowed, err := rl.Allow(ctx, "test-fractional", 0.5)
+	if err != nil {
+		t.Fatalf("Allow() error = %v", err)
+	}
+	if !allowed {
+		t.Error("Request with fractional tokens should be allowed")
+	}
+
+	for i := 0; i < 19; i++ {
+		allowed, _ := rl.Allow(ctx, "test-fractional", 0.5)
+		if !allowed {
+			t.Errorf("Request %d should be allowed", i)
+		}
+	}
+
+	allowed, _ = rl.Allow(ctx, "test-fractional", 0.5)
+	if allowed {
+		t.Error("Request should be denied after consuming all tokens")
+	}
+}
+
+func TestAllow_EmptyKey(t *testing.T) {
+	setupTestRedis(t)
+
+	ctx := context.Background()
+	cfg := Config{
+		RedisAddr: "localhost:6379",
+		RedisDB:   15,
+		Rate:      10,
+		Burst:     10,
+	}
+
+	rl, err := NewRateLimiter(ctx, cfg)
+	if err != nil {
+		t.Fatalf("NewRateLimiter() error = %v", err)
+	}
+	defer rl.Close()
+
+	allowed, err := rl.Allow(ctx, "", 1)
+	if err != nil {
+		t.Fatalf("Allow() error = %v", err)
+	}
+	if !allowed {
+		t.Error("Empty key should be allowed (valid use case)")
+	}
+}
+
+func TestAllow_LargeBurst(t *testing.T) {
+	setupTestRedis(t)
+
+	ctx := context.Background()
+	cfg := Config{
+		RedisAddr: "localhost:6379",
+		RedisDB:   15,
+		Rate:      1000,
+		Burst:     10000,
+	}
+
+	rl, err := NewRateLimiter(ctx, cfg)
+	if err != nil {
+		t.Fatalf("NewRateLimiter() error = %v", err)
+	}
+	defer rl.Close()
+
+	allowed, err := rl.Allow(ctx, "test-large", 5000)
+	if err != nil {
+		t.Fatalf("Allow() error = %v", err)
+	}
+	if !allowed {
+		t.Error("Large token request should be allowed")
+	}
+
+	allowed, err = rl.Allow(ctx, "test-large", 5000)
+	if err != nil {
+		t.Fatalf("Allow() error = %v", err)
+	}
+	if !allowed {
+		t.Error("Second large token request should be allowed")
+	}
+
+	allowed, err = rl.Allow(ctx, "test-large", 1)
+	if err != nil {
+		t.Fatalf("Allow() error = %v", err)
+	}
+	if allowed {
+		t.Error("Request beyond bucket should be denied")
+	}
+}
+
+func TestAllow_ContextCancellation(t *testing.T) {
+	setupTestRedis(t)
+
+	cfg := Config{
+		RedisAddr: "localhost:6379",
+		RedisDB:   15,
+		Rate:      10,
+		Burst:     10,
+	}
+
+	ctx := context.Background()
+	rl, err := NewRateLimiter(ctx, cfg)
+	if err != nil {
+		t.Fatalf("NewRateLimiter() error = %v", err)
+	}
+	defer rl.Close()
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	_, err = rl.Allow(cancelCtx, "test-cancel", 1)
+	if err == nil {
+		t.Error("Allow() should return error with cancelled context")
+	}
+}
+
+func TestNewRateLimiter_InvalidConfig(t *testing.T) {
+	ctx := context.Background()
+	cfg := Config{
+		RedisAddr: "localhost:6379",
+		RedisDB:   15,
+		Rate:      0,
+		Burst:     10,
+	}
+
+	_, err := NewRateLimiter(ctx, cfg)
+	if err == nil {
+		t.Error("NewRateLimiter() should return error for invalid config")
+	}
+}
+
+func TestNewRateLimiter_ConnectionFailure(t *testing.T) {
+	ctx := context.Background()
+	cfg := Config{
+		RedisAddr: "localhost:9999",
+		RedisDB:   15,
+		Rate:      10,
+		Burst:     10,
+	}
+
+	_, err := NewRateLimiter(ctx, cfg)
+	if err == nil {
+		t.Error("NewRateLimiter() should return error for bad connection")
+	}
+}
+
+func setupBenchmarkRedis(b *testing.B) *RateLimiter {
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+		DB:   15,
+	})
+
+	ctx := context.Background()
+	if err := client.Ping(ctx).Err(); err != nil {
+		b.Skipf("Redis not available: %v", err)
+	}
+
+	if err := client.FlushDB(ctx).Err(); err != nil {
+		b.Fatalf("Failed to flush test DB: %v", err)
+	}
+
+	cfg := Config{
+		RedisAddr: "localhost:6379",
+		RedisDB:   15,
+		Rate:      1000,
+		Burst:     1000,
+	}
+
+	rl, err := NewRateLimiter(ctx, cfg)
+	if err != nil {
+		b.Fatalf("NewRateLimiter() error = %v", err)
+	}
+
+	return rl
+}
+
+func BenchmarkAllow_Sequential(b *testing.B) {
+	rl := setupBenchmarkRedis(b)
+	defer rl.Close()
+
+	ctx := context.Background()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		rl.Allow(ctx, "bench-seq", 1)
+	}
+}
+
+func BenchmarkAllow_Parallel(b *testing.B) {
+	rl := setupBenchmarkRedis(b)
+	defer rl.Close()
+
+	ctx := context.Background()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			key := "bench-parallel-" + string(rune(i%100))
+			rl.Allow(ctx, key, 1)
+			i++
+		}
+	})
+}
+
+func BenchmarkAllow_HighContention(b *testing.B) {
+	rl := setupBenchmarkRedis(b)
+	defer rl.Close()
+
+	ctx := context.Background()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			rl.Allow(ctx, "single-key", 1)
+		}
+	})
+}
+
+func BenchmarkAllow_LowContention(b *testing.B) {
+	rl := setupBenchmarkRedis(b)
+	defer rl.Close()
+
+	ctx := context.Background()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			key := "bench-low-" + string(rune(i))
+			rl.Allow(ctx, key, 1)
+			i++
+		}
+	})
+}
+
+func BenchmarkAllow_Denied(b *testing.B) {
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+		DB:   15,
+	})
+
+	ctx := context.Background()
+	if err := client.Ping(ctx).Err(); err != nil {
+		b.Skipf("Redis not available: %v", err)
+	}
+
+	client.FlushDB(ctx)
+
+	cfg := Config{
+		RedisAddr: "localhost:6379",
+		RedisDB:   15,
+		Rate:      1,
+		Burst:     1,
+	}
+
+	rl, err := NewRateLimiter(ctx, cfg)
+	if err != nil {
+		b.Fatalf("NewRateLimiter() error = %v", err)
+	}
+	defer rl.Close()
+
+	rl.Allow(ctx, "bench-denied", 1)
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		rl.Allow(ctx, "bench-denied", 1)
+	}
+}
+
+func BenchmarkAllow_FractionalTokens(b *testing.B) {
+	rl := setupBenchmarkRedis(b)
+	defer rl.Close()
+
+	ctx := context.Background()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		rl.Allow(ctx, "bench-frac", 0.1)
+	}
+}
+
+func BenchmarkConfigValidation(b *testing.B) {
+	cfg := Config{
+		RedisAddr: "localhost:6379",
+		Rate:      10,
+		Burst:     20,
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		cfg.Validate()
+	}
+}
