@@ -632,7 +632,9 @@ func BenchmarkAllow_Denied(b *testing.B) {
 		b.Skipf("Redis not available: %v", err)
 	}
 
-	client.FlushDB(ctx)
+	if err := client.FlushDB(ctx).Err(); err != nil {
+		b.Fatalf("Failed to flush test DB: %v", err)
+	}
 
 	cfg := Config{
 		RedisAddr: "localhost:6379",
