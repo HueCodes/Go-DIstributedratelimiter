@@ -625,6 +625,7 @@ func BenchmarkAllow_Denied(b *testing.B) {
 		Addr: "localhost:6379",
 		DB:   15,
 	})
+	defer client.Close()
 
 	ctx := context.Background()
 	if err := client.Ping(ctx).Err(); err != nil {
