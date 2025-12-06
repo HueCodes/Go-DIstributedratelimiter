@@ -10,9 +10,12 @@ import (
 	"github.com/HueCodes/Go-DIstributedratelimiter/ratelimiter"
 )
 
-// getClientIP extracts the client IP from the request.
+// KeyExtractor is a function that extracts a rate limiting key from an HTTP request.
+type KeyExtractor func(*http.Request) string
+
+// ClientIPKeyExtractor extracts the client IP from the request.
 // Checks X-Forwarded-For header first, falls back to RemoteAddr.
-func getClientIP(r *http.Request) string {
+func ClientIPKeyExtractor(r *http.Request) string {
 	forwarded := r.Header.Get("X-Forwarded-For")
 	if forwarded != "" {
 		parts := strings.Split(forwarded, ",")
@@ -25,12 +28,28 @@ func getClientIP(r *http.Request) string {
 	return ip
 }
 
-// RateLimitMiddleware wraps an HTTP handler with rate limiting per client IP.
-func RateLimitMiddleware(rl *ratelimiter.RateLimiter) func(http.Handler) http.Handler {
+// HeaderKeyExtractor returns a KeyExtractor that uses a specific header value.
+func HeaderKeyExtractor(headerName string) KeyExtractor {
+	return func(r *http.Request) string {
+		return r.Header.Get(headerName)
+	}
+}
+
+// PathKeyExtractor extracts the request path as the key.
+func PathKeyExtractor(r *http.Request) string {
+	return r.URL.Path
+}
+
+// RateLimitMiddleware wraps an HTTP handler with rate limiting.
+// The keyExtractor function determines how to extract the rate limiting key from each request.
+func RateLimitMiddleware(rl *ratelimiter.RateLimiter, keyExtractor KeyExtractor) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			clientIP := getClientIP(r)
-			key := "client:" + clientIP
+			key := keyExtractor(r)
+			if key == "" {
+				http.Error(w, "Unable to determine rate limit key", http.StatusBadRequest)
+				return
+			}
 
 			allowed, err := rl.Allow(r.Context(), key, 1)
 			if err != nil {
@@ -71,7 +90,8 @@ func main() {
 		fmt.Fprintln(w, "Hello, world!")
 	})
 
-	handler := RateLimitMiddleware(rl)(mux)
+	// Use ClientIPKeyExtractor for IP-based rate limiting
+	handler := RateLimitMiddleware(rl, ClientIPKeyExtractor)(mux)
 	fmt.Println("Starting server on :8080")
 	if err := http.ListenAndServe(":8080", handler); err != nil {
 		fmt.Printf("Server failed: %v\n", err)
