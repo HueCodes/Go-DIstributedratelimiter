@@ -613,7 +613,7 @@ func BenchmarkAllow_LowContention(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		i := 0
 		for pb.Next() {
-			key := "bench-low-" + string(rune(i))
+			key := "bench-low-" + strconv.Itoa(i)
 			rl.Allow(ctx, key, 1)
 			i++
 		}
