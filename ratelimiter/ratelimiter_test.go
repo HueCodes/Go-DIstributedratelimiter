@@ -2,6 +2,7 @@ package ratelimiter
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -581,7 +582,7 @@ func BenchmarkAllow_Parallel(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		i := 0
 		for pb.Next() {
-			key := "bench-parallel-" + string(rune(i%100))
+			key := "bench-parallel-" + strconv.Itoa(i%100)
 			rl.Allow(ctx, key, 1)
 			i++
 		}
