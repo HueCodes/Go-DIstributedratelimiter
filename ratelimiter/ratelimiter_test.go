@@ -266,19 +266,28 @@ func TestAllow_MultipleKeys(t *testing.T) {
 	defer rl.Close()
 
 	for i := 0; i < 2; i++ {
-		allowed, _ := rl.Allow(ctx, "key1", 1)
+		allowed, err := rl.Allow(ctx, "key1", 1)
+		if err != nil {
+			t.Fatalf("Allow() error = %v", err)
+		}
 		if !allowed {
 			t.Error("key1 should be allowed")
 		}
 	}
 
-	allowed, _ := rl.Allow(ctx, "key1", 1)
+	allowed, err := rl.Allow(ctx, "key1", 1)
+	if err != nil {
+		t.Fatalf("Allow() error = %v", err)
+	}
 	if allowed {
 		t.Error("key1 should be denied after burst")
 	}
 
 	for i := 0; i < 2; i++ {
-		allowed, _ := rl.Allow(ctx, "key2", 1)
+		allowed, err := rl.Allow(ctx, "key2", 1)
+		if err != nil {
+			t.Fatalf("Allow() error = %v", err)
+		}
 		if !allowed {
 			t.Error("key2 should be allowed independently")
 		}
